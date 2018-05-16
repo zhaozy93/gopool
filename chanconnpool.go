@@ -59,7 +59,7 @@ type connAttr struct {
 	inpool bool
 	//Whether or not connected to borrow
 	//是否为借的连接
-	borrow bool
+	// borrow bool
 	//Life values, the second
 	//生命值, 秒
 	life int64
@@ -152,13 +152,13 @@ func NewChanConnPool(req *ConnPoolReq) (*ChanConnPool, error) {
 
 //According to the link for the connection properties
 //根据连接获取该连接的属性
-func (pool *ChanConnPool) getMapConn(c interface{}) (string, bool, bool, bool) {
+func (pool *ChanConnPool) getMapConn(c interface{}) (string, bool, bool) {
 	pool.mlocker.RLock()
 	defer pool.mlocker.RUnlock()
 	if connattr, ok := pool.mapConn[c]; ok {
-		return connattr.addr, connattr.inpool, connattr.borrow, ok
+		return connattr.addr, connattr.inpool, ok
 	} else {
-		return "", false, false, false
+		return "", false, false
 	}
 }
 
@@ -186,18 +186,15 @@ func (pool *ChanConnPool) setMapConnState(c interface{}, in bool) {
 
 //Sets whether connect the corresponding address and connection to borrow
 //设置连接对应的地址和是否为借的连接
-func (pool *ChanConnPool) setMapConnAddr(c interface{}, addr string, borrow bool) {
+func (pool *ChanConnPool) setMapConnAddr(c interface{}, addr string) {
 	pool.mlocker.Lock()
 	defer pool.mlocker.Unlock()
 	if attr, ok := pool.mapConn[c]; !ok {
 		pool.mapConn[c] = &connAttr{
 			addr:   addr,
 			inpool: false,
-			borrow: borrow,
 			life:   time.Now().Unix(),
 		}
-	} else {
-		attr.borrow = borrow
 	}
 }
 
@@ -245,10 +242,8 @@ func (pool *ChanConnPool) addAddr(addr string) {
 func (pool *ChanConnPool) tryIncAddrConnCount(addr string) bool {
 	pool.locker.Lock()
 	defer pool.locker.Unlock()
-	if pool.getAddrConnCount(addr) < pool.capIdle(addr) {
-		if attr, ok := pool.addrs[addr]; ok {
-			atomic.AddInt32(&attr.conncount, 1)
-		}
+	if attr, ok := pool.addrs[addr]; ok {
+		atomic.AddInt32(&attr.conncount, 1)
 		return true
 	}
 	return false
@@ -262,6 +257,7 @@ func (pool *ChanConnPool) decAddrConnCount(addr string) {
 
 func (pool *ChanConnPool) getAddrConnCount(addr string) int {
 	if attr, ok := pool.addrs[addr]; ok {
+		return len(pool.)
 		return int(attr.conncount)
 	}
 	return 0
@@ -433,27 +429,34 @@ func (pool *ChanConnPool) getIdle() map[string]chan interface{} {
 }
 
 func (pool *ChanConnPool) inIdle(addr string, c interface{}) {
-	if pool.lenIdle(addr) >= pool.capIdle(addr) {
-		return
-	}
-	if queue, ok := pool.getIdle()[addr]; ok {
-		queue <- c
-		pool.setMapConnState(c, true)
-	}
+	// if pool.lenIdle(addr) >= pool.capIdle(addr) {
+	// 	return
+	// }
+	pool.setMapConnState(c, true)
+	// if queue, ok := pool.getIdle()[addr]; ok {
+	// 	queue <- c
+	// 	pool.setMapConnState(c, true)
+	// }
 }
 
+// 从连接池拿一个连接
 func (pool *ChanConnPool) outIdle(addr string) (interface{}, error) {
 	if queue, ok := pool.getIdle()[addr]; ok {
 		select {
+		// 队列中有数据取出则代表有可用连接
+		// 将这个连接设为不在连接池
 		case client := <-queue:
 			pool.setMapConnState(client, false)
 			return client, nil
+			// 队列中没有连接可用走default
+			// 走default则意味着新建一个连接
 		default:
 			cli, err := pool.newConn(addr, pool.connSvrTimeout)
 			if err != nil {
 				return nil, err
 			}
-			pool.setMapConnAddr(cli, addr, true)
+			//  ??? 为什么要判断这个 待确定
+			pool.setMapConnAddr(cli, addr)
 			return cli, err
 		}
 	}
@@ -487,7 +490,7 @@ func (pool *ChanConnPool) reachLife(c interface{}) (reach bool) {
 }
 
 func (pool *ChanConnPool) getAddrByConn(c interface{}) (string, bool) {
-	addr, _, _, ok := pool.getMapConn(c)
+	addr, _, ok := pool.getMapConn(c)
 	return addr, ok
 }
 
@@ -506,21 +509,25 @@ func (pool *ChanConnPool) Get() (interface{}, error) {
 }
 
 func (pool *ChanConnPool) Put(cli interface{}, safe bool) {
-	if addr, _, borrow, ok := pool.getMapConn(cli); ok {
-		if borrow {
-			if pool.tryIncAddrConnCount(addr) {
-				pool.setMapConnAddr(cli, addr, false)
-			} else {
-				pool.down(cli)
-				pool.deleteMapConn(cli)
-				return
-			}
+	if addr, _, ok := pool.getMapConn(cli); ok {
+		select {
+		// 能把这个连接扔进队列中
+		// 则证明队列不满
+		case pool.getIdle()[addr] <- cli:
+			pool.tryIncAddrConnCount(addr)
+			// 扔不进去走default
+			// 即关闭这个连接
+		default:
+			pool.down(cli)
+			pool.deleteMapConn(cli)
+			return
 		}
 		if safe {
 			pool.decAddrUnSafeCount(addr)
 		} else {
 			pool.incAddrUnSafeCount(addr)
 		}
+		// 如果连接池关闭 || 不安全 || 当前连接达到最大生命周期
 		if !pool.isOpen(cli) || !safe || pool.reachLife(cli) {
 			pool.down(cli)
 			pool.deleteMapConn(cli)
@@ -543,7 +550,6 @@ func (pool *ChanConnPool) GetHealthy() map[string]bool {
 func (pool *ChanConnPool) GetUnhealthyNodeCount() (int, []string) {
 	retCnt := 0
 	retIp := []string{}
-
 	for k, v := range pool.getAllAddr() {
 		if !v.health {
 			retCnt++
