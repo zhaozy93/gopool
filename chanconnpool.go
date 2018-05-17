@@ -23,7 +23,7 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
-	"sync/atomic"
+	// "sync/atomic"
 	"time"
 )
 
@@ -156,7 +156,7 @@ func (pool *ChanConnPool) getMapConn(c interface{}) (string, bool) {
 	if connattr, ok := pool.mapConn[c]; ok {
 		return connattr.addr, ok
 	} else {
-		return "", false, false
+		return "", false
 	}
 }
 
@@ -172,22 +172,12 @@ func (pool *ChanConnPool) getConnLife(c interface{}) int64 {
 	}
 }
 
-//Set the state of connections in the pool
-//设置连接是否在池中的状态
-func (pool *ChanConnPool) setMapConnState(c interface{}, in bool) {
-	pool.mlocker.Lock()
-	defer pool.mlocker.Unlock()
-	if attr, ok := pool.mapConn[c]; ok {
-		attr.inpool = in
-	}
-}
-
 //Sets whether connect the corresponding address and connection to borrow
 //设置连接对应的地址和是否为借的连接
 func (pool *ChanConnPool) setMapConnAddr(c interface{}, addr string) {
 	pool.mlocker.Lock()
 	defer pool.mlocker.Unlock()
-	if attr, ok := pool.mapConn[c]; !ok {
+	if _, ok := pool.mapConn[c]; !ok {
 		pool.mapConn[c] = &connAttr{
 			addr: addr,
 			life: time.Now().Unix(),
@@ -228,7 +218,7 @@ func (pool *ChanConnPool) getAllAddr() map[string]*addrAttr {
 func (pool *ChanConnPool) addAddr(addr string) {
 	pool.alocker.Lock()
 	defer pool.alocker.Unlock()
-	pool.addrs[addr] = &addrAttr{true, 0, int64(0), 0}
+	pool.addrs[addr] = &addrAttr{true, 0, int64(0)}
 	if pool.al == nil {
 		pool.al = []string{}
 	}
@@ -400,7 +390,7 @@ func (pool *ChanConnPool) outIdle(addr string) (interface{}, error) {
 		// 队列中有数据取出则代表有可用连接
 		// 将这个连接设为不在连接池
 		case client := <-queue:
-			pool.setMapConnState(client, false)
+			// pool.setMapConnState(client, false)
 			return client, nil
 			// 队列中没有连接可用走default
 			// 走default则意味着新建一个连接
@@ -409,7 +399,6 @@ func (pool *ChanConnPool) outIdle(addr string) (interface{}, error) {
 			if err != nil {
 				return nil, err
 			}
-			//  ??? 为什么要判断这个 待确定
 			pool.setMapConnAddr(cli, addr)
 			return cli, err
 		}
@@ -458,7 +447,7 @@ func (pool *ChanConnPool) Get() (interface{}, error) {
 }
 
 func (pool *ChanConnPool) Put(cli interface{}, safe bool) {
-	if addr, _, ok := pool.getMapConn(cli); ok {
+	if addr, ok := pool.getMapConn(cli); ok {
 		// 这个提到前面来，不管能不能放回池子里都应该不影响errcount的统计
 		if safe {
 			pool.decAddrUnSafeCount(addr)
@@ -472,18 +461,18 @@ func (pool *ChanConnPool) Put(cli interface{}, safe bool) {
 			pool.deleteMapConn(cli)
 			return
 		}
+		queue := pool.getIdle()[addr]
 		// 满足扔进池子的条件，尝试扔进池子
 		select {
 		// 能把这个连接扔进队列中
 		// 则证明队列不满
-		case pool.getIdle()[addr] <- cli:
+		case queue <- cli:
 			// 扔不进去走default
 			// 即关闭这个连接
 		default:
 			pool.down(cli)
 			pool.deleteMapConn(cli)
 		}
-
 	}
 	return
 }
@@ -516,7 +505,7 @@ func (pool *ChanConnPool) GetConnCount() map[string]int {
 	res := map[string]int{}
 	for _, conn := range pool.mapConn {
 		addr := conn.addr
-		if val, ok := res[addr]; ok {
+		if _, ok := res[addr]; ok {
 			res[addr] = res[addr] + 1
 		} else {
 			res[addr] = 1
@@ -528,7 +517,5 @@ func (pool *ChanConnPool) GetConnCount() map[string]int {
 // 获取所有连接长度直接使用mapConn的长度 因为所有连接都在这里面
 // ?
 func (pool *ChanConnPool) GetConnAllCount() int {
-	pool.mlocker.RLock()
-	defer pool.mlocker.RUnlock()
-	return len(pool.mapConn)
+	return pool.lenMapConn()
 }
